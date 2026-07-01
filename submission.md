@@ -181,3 +181,42 @@ other callers of `get_playlist_songs`: the only functional caller is the GET rou
 to display the whole playlist, so restoring all songs is exactly what it wants. `notification_service`
 imports the function inside `add_to_playlist` but never calls it (it uses the `playlist.songs`
 relationship for its membership check), so no other behavior depended on the truncated result.
+
+### Issue #4: I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it.** There was no existing test for this, so I wrote a short script that creates
+a sharer and a separate rater, has the rater call `rate_song(rater, song, 5)` on the sharer's song,
+then calls `get_notifications(sharer)`. The result was 0 notifications: rating a song produced no
+notification for the sharer, while the "added to playlist" flow does. (I later turned this into the
+regression test described below.)
+
+**How I found the root cause.** Following the brief's hint that this is architectural rather than a
+typo, I traced both parallel actions from their routes: `POST /songs/<id>/rate` in `routes/songs.py`
+calls `rate_song`, and `POST /playlists/<id>/songs` in `routes/playlists.py` calls `add_to_playlist`
+(both in `notification_service.py`). I read the two functions side by side. `add_to_playlist` ends
+with a clear notification block: `if song.shared_by != added_by_user_id: create_notification(...)`.
+`rate_song` had no equivalent block at all: it validated the score, saved or updated the `Rating`,
+committed, and returned. The moment of confidence was seeing that the working function had a whole
+"notify the sharer" step that the broken one was simply missing.
+
+**The root cause.** `rate_song` never called `create_notification`. The rating was persisted
+correctly, but the code path that turns "someone interacted with your song" into a `Notification`
+row existed only for playlist adds, not for ratings. This is a missing feature/step, not a wrong
+comparison, which is why the fix mirrors an existing pattern rather than correcting a line.
+
+**My fix and side-effect check.** After `rate_song` commits the rating, I added the same notify
+pattern used by `add_to_playlist`: if the rater is not the song's sharer, create a `song_rated`
+notification addressed to `song.shared_by`. I guarded on `song.shared_by != user_id` so that rating
+your own song does not notify yourself. Side-effect checks: (1) a different user rating a song now
+yields exactly one `song_rated` notification with the correct body; (2) a user rating their own song
+yields zero notifications, confirming the self-rating guard; (3) the full test suite (15 tests)
+still passes, so the added commit path did not disturb rating persistence or the existing
+playlist-add notification. I also confirmed the notification type string (`song_rated`) matches the
+type named in `create_notification`'s own docstring, keeping it consistent with the existing
+convention.
+
+**Regression test.** `tests/test_notifications.py` contains `test_rating_a_song_notifies_the_sharer`,
+which rates another user's song and asserts the sharer receives exactly one `song_rated`
+notification. Against the original code this assertion fails (the count is 0), so the test would
+have caught the bug before it shipped. A companion test,
+`test_rating_your_own_song_does_not_notify`, locks in the self-rating guard.
