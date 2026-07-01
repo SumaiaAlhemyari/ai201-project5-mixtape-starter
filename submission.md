@@ -1,5 +1,38 @@
 # Project 5: Mixtape Bug Hunt (Submission)
 
+## AI Usage
+
+I used an AI assistant (Claude) mainly for codebase navigation and for running/interpreting
+reproductions, and I verified its output by reading the code and running the tests myself.
+
+**Codebase navigation.** For each bug I had the AI help me trace the call chain from the HTTP
+route down to the service function, rather than jumping straight to the service file. For example,
+for the streak bug it confirmed that `POST /songs/<id>/listen` calls `record_listening_event`,
+which delegates to `update_listening_streak`, so I knew exactly which function held the logic before
+reading it. I did the actual reading and pointed to the offending lines myself.
+
+**Understanding specific semantics.** I asked the AI to confirm what `datetime.weekday()` returns
+for each day (Monday is 0, Sunday is 6). That was the fact that made the streak root cause concrete:
+the branch `today.weekday() != 6` was silently excluding Sundays. I checked this against the test,
+which uses a real Sunday date, so the explanation was verified rather than taken on faith.
+
+**Reproduction and verification.** The AI helped me run `pytest` per feature and read the failures
+(for example, the playlist test reporting "Right contains one more item: 'Track 5'", which pointed
+straight at the `[:-1]` slice). It also helped me write a small script to reproduce Issue #4, where
+rating a song produced zero notifications. After every fix I re-ran the tests to confirm both the
+fix and that nothing else broke.
+
+**Where I had to course-correct the AI.** The most important instance was Issue #3 (search
+duplicates). The obvious hypothesis was that the missing `.distinct()` would produce duplicate rows
+in search results. But when I ran the search tests they all *passed*, so the user-visible duplicate
+did not reproduce. Instead of fixing blindly, I ran a direct experiment comparing the raw join row
+count (3 rows for a 3-tag song) against the full-entity query result (1 object). That proved the
+query really does fan out at the SQL level, but SQLAlchemy's legacy Query API deduplicates full
+mapped entities by primary key, which masks the symptom in this environment. So I documented Issue
+#3 honestly as a real-but-masked query defect and applied `.distinct()` as the correct defensive
+fix, rather than claiming a reproduction I could not actually show. This is a case where the
+plausible AI-style answer was incomplete and running the code myself changed the conclusion.
+
 ## Codebase Map
 
 *(Written during orientation, before any bug work.)*
@@ -220,3 +253,37 @@ which rates another user's song and asserts the sharer receives exactly one `son
 notification. Against the original code this assertion fails (the count is 0), so the test would
 have caught the bug before it shipped. A companion test,
 `test_rating_your_own_song_does_not_notify`, locks in the self-rating guard.
+
+### Issue #3: The same song keeps showing up twice in search
+
+**How I reproduced it (and the honest nuance).** I first ran `pytest tests/test_search.py -v`,
+expecting `test_search_no_duplicates_multi_tag_song` (a song with 3 tags) to fail. It passed, and so
+did all the search tests: the user-visible duplicate did not reproduce in this environment. Rather
+than fix blindly, I ran a direct experiment on the query. Querying `Song.id` over the same
+`outerjoin` returned **3 rows** for the 3-tag song, while the full-entity query
+`db.session.query(Song)...all()` returned **1 object**. So the defect is real at the SQL level (the
+join fans out to one row per tag), but SQLAlchemy's legacy Query API deduplicates full mapped
+entities by primary key, which masks the duplicate before `to_dict()` runs. In an older SQLAlchemy,
+or if the code selected columns instead of the whole entity (as many "duplicate in results" bugs
+do), the duplicate would surface.
+
+**How I found the root cause.** I traced from `GET /songs/search` in `routes/songs.py` to
+`search_songs` in `search_service.py`. The query `outerjoin`s `song_tags` but never references a tag
+in the `filter` (it only matches on `Song.title`/`Song.artist`), and there is no `.distinct()`. A
+left join against a one-to-many association with no de-duplication is the classic cause of one output
+row per child, so the number of duplicate rows equals the number of tags. That matched the
+experiment exactly (3 tags gave 3 rows).
+
+**The root cause.** The search query joins the `song_tags` association table but does not
+de-duplicate, so each matching song is emitted once per associated tag. A song with N tags produces
+N identical rows. The join contributes nothing to the search itself (tags are not part of the filter,
+and `Song.tags` is loaded separately via its `lazy="subquery"` relationship), so its only effect is
+this row multiplication.
+
+**My fix and side-effect check.** I added `.distinct()` to the query so the database returns each
+song once regardless of tag count. After the fix, the raw join returns 1 row for the 3-tag song
+(down from 3), and all 15 tests pass, including the 0-tag and 1-tag search cases, confirming songs
+with fewer tags are unaffected and no result is dropped. I verified the fix at the SQL row level
+rather than relying on the ORM's masking, so the query is now correct on its own terms. (An
+equivalent fix would be to remove the unused `outerjoin` entirely; I chose `.distinct()` as the
+smaller change that preserves the existing query shape.)
