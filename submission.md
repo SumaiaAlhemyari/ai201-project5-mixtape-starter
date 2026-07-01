@@ -150,3 +150,34 @@ about most was `test_streak_resets_after_skipped_day`, because my edit sits dire
 reset path: I confirmed a skipped day still resets to 1, so I only re-enabled the legitimate
 Sunday increment without weakening the reset logic. I also confirmed the same-day
 (no-double-count) and new-user paths still behave correctly.
+
+### Issue #5: The last song in a playlist never shows up
+
+**How I reproduced it.** I ran `pytest tests/test_playlists.py -v`. The fixture builds a playlist
+with 5 songs at positions 1 to 5. Two tests failed: `test_playlist_returns_all_songs` (expected 5,
+got 4) and `test_playlist_returns_songs_in_order`, which reported the returned titles as
+`['Track 1', 'Track 2', 'Track 3', 'Track 4']` with pytest noting *"Right contains one more item:
+'Track 5'"*. `test_empty_playlist_returns_empty_list` passed. That told me the last element of a
+non-empty, position-ordered list was being dropped.
+
+**How I found the root cause.** I traced from `GET /playlists/<id>/songs` in `routes/playlists.py`,
+which calls `get_playlist_songs` in `playlist_service.py`. Reading that function, the SQL query is
+correct: it joins `playlist_entries`, filters by playlist, and orders ascending by
+`playlist_entries.position`, so it fetches all songs in order. The bug had to be after the query.
+The `return` statement on line 66 was the giveaway: `return [song.to_dict() for song in songs[:-1]]`.
+The `[:-1]` slice is the only thing between a correct query and a short result.
+
+**The root cause.** The list comprehension iterates over `songs[:-1]` instead of `songs`. The
+slice `[:-1]` returns every element except the last. Because the query orders songs ascending by
+`position`, the excluded element is always the highest-position song, so every non-empty playlist
+silently loses its final track. Empty playlists are unaffected because slicing an empty list still
+yields an empty list, which is why `test_empty_playlist_returns_empty_list` passed and masked the
+severity.
+
+**My fix and side-effect check.** I changed the return to iterate over the full list:
+`return [song.to_dict() for song in songs]`. After the fix all 3 playlist tests pass, including the
+empty-playlist case, confirming I didn't break the empty path. I also grepped the codebase for
+other callers of `get_playlist_songs`: the only functional caller is the GET route, which is meant
+to display the whole playlist, so restoring all songs is exactly what it wants. `notification_service`
+imports the function inside `add_to_playlist` but never calls it (it uses the `playlist.songs`
+relationship for its membership check), so no other behavior depended on the truncated result.
